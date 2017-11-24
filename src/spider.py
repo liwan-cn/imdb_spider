@@ -1,16 +1,21 @@
 import requests
 import time
 import csv
+import os
 import random
+import pickle
 import lxml.etree as etree
 from multiprocessing import Lock, Pool
 
 def init():
+    """
+    初始化所有的去全局变量
+    :return: None
+    """
     global USER_AGENTS
     global ReviewDataPath, MovieIdDataPath, FinishedMivieIdPath
     global proxyHost, proxyPort, proxyUser, proxyPass, proxyMeta
     global proxies
-    # duoipqfnhqhkg:mBiXA5FnZ6bNG@ip2.hahado.cn:41400
 
     USER_AGENTS = [
         "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1; SV1; AcooBrowser; .NET CLR 1.1.4322; .NET CLR 2.0.50727)",
@@ -36,9 +41,10 @@ def init():
     FinishedMivieIdPath = "finished.csv"
 
     proxyHost = "ip2.hahado.cn"
-    proxyPort = "41400"
+    proxyPort = "41520"
     proxyUser = "duoipqfnhqhkg"
-    proxyPass = "mBiXA5FnZ6bNG"
+    proxyPass = "g5fYWxr3MV57w"
+    # duoipqfnhqhkg:g5fYWxr3MV57w@ip2.hahado.cn:41520
     # duoipqfnhqhkg:mBiXA5FnZ6bNG@ip2.hahado.cn:41400
     proxyMeta = "http://%(user)s:%(pass)s@%(host)s:%(port)s" % {
         "host": proxyHost,
@@ -51,6 +57,35 @@ def init():
         "https": proxyMeta,
     }
 
+def save(obj, fileName):
+    """
+    存储爬取状态
+    :param obj:  对象名
+    :param fileName: 存储文件
+    :return: None
+    """
+    lock.acquire()
+    output = open(fileName, 'wb')
+    pickle.dump(obj, output)
+    output.close()
+    lock.release()
+
+def load(fileName):
+    """
+    加载爬取状态
+    :param fileName: 文件名
+    :return: 爬取状态对应的字典
+    """
+    lock.acquire()
+    if os.path.exists(fileName):
+        input = open(fileName, 'rb')
+        data = pickle.load(input)
+        input.close()
+    else:
+        data = {}
+    lock.release()
+    return data
+
 def getAllPageReview(movieId):
     """
     获取一部电影的所有评论
@@ -58,38 +93,61 @@ def getAllPageReview(movieId):
     :return: None
     """
     startTime = time.time()
-    allPageReviewList = []
-    flag = False
+    # 爬取状态为一个Python字典对象
+    # key为movieId
+    # value为一个List，List的最后一项为该部电影最后爬取并存储的位置
+    crawlingStatus = load("crawling_status.pkl") #先加载爬取状态
     start = 0
-    while flag == False:
+    if movieId in crawlingStatus: #说明这部电影之前爬取了一部分
+        if len(crawlingStatus[movieId]) > 0:
+            start = crawlingStatus[movieId][-1]
+    allPageReviewList = []
+    length = 10
+    # 初始化length = 10
+    # imdb评论页面有10条评论
+    # 如果length < 10 说明已经爬取到了该电影的所有评论
+    while length == 10:
         url = "http://www.imdb.com/title/%s/reviews?start=%d" % (movieId, start)
-        flag, onePageReviewList = getOnePageReview(movieId, url)
+        length, onePageReviewList = getOnePageReview(movieId, url)
         allPageReviewList.extend(onePageReviewList)
-        start += 10
-        # if start % 500 == 0:
-        #     saveInfo(allPageReviewList)
-        #     allPageReviewList = []
+        start += 10 # 加10
+        if start % 100 == 0 and start > 10: # 每100条评论就存入文件并更新爬取状态
+            saveInfo(allPageReviewList)
+            if movieId in crawlingStatus:
+                crawlingStatus[movieId].append(start) #爬取状态更新
+            else:
+                crawlingStatus[movieId] = [start] #爬取状态加入
+            save(crawlingStatus, "crawling_status.pkl")
+            allPageReviewList = []
     endTime = time.time()
+    saveInfo(allPageReviewList) # 不到100条也存储
+    # 存储已经爬取完毕的movieID
     lock.acquire()
     with open(FinishedMivieIdPath, 'a', encoding="utf-8", newline="") as f:  # 必须用'a'模式打开
         writer_review = csv.writer(f)  # 创建写对象
         writer_review.writerow([movieId])
     lock.release()
-    print("ID 为 %s 的电影爬取完成，共 %d 条评论，用时%d秒，完成时间：%s。" % (movieId, len(allPageReviewList), endTime-startTime, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(endTime))))
-    saveInfo(allPageReviewList)
+    print("ID 为 %s 的电影爬取完成，共 %d 条评论，用时%d秒，完成时间：%s。" % (movieId, start + length, endTime-startTime, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(endTime))))
 
 def requestsURL(url, headers, proxies):
+    """
+    http请求
+    :param url: 页面url
+    :param headers: 请求头部
+    :param proxies: ip代理
+    :return: 请求到的html
+    """
     try:
         return requests.get(url, headers=headers, proxies=proxies)
-    except:
+    except: #出错就继续请求
         print("URL : %s Requests Error" % (url))
         return requestsURL(url, headers, proxies)
 
 def getOnePageReview(movieId, url):
     """
-    获得一个页面的所有评论
+    获得一个页面的评论
     :param url: 页面url
-    :return: True or False
+    :return: 该页面评论数和评论
     """
     headers = {'User-Agent': random.choice(USER_AGENTS)}
     html = requestsURL(url, headers, proxies)
@@ -100,6 +158,8 @@ def getOnePageReview(movieId, url):
         length = len(user)
     reTryTime = 0
     while length == 0 and reTryTime <= 12:
+        # 如果该页面有0条评论说明已经爬取（总评论数为10的整数倍）完成或者页面返回错误
+        # y页面返回错去就要sleep后重试 防止IP被封
         time.sleep(5)
         html = requestsURL(url, headers, proxies)
         length = 0
@@ -113,6 +173,7 @@ def getOnePageReview(movieId, url):
     onePageReviewList = []
     # print(length)
     for i in range(length):
+        #  解析页面
         userWithUser = etree.HTML(text).xpath('//*[@id="tn15content"]/div[%d]/a[1]/@href' % (2 * i + 1))
         reviewLines = etree.HTML(text).xpath('//*[@id="tn15content"]/p[%d]/text()' % (i + 1))
         scoreOfTen = etree.HTML(text).xpath('//*[@id="tn15content"]/div[%d]/img/@alt' % (2 * i + 1))
@@ -134,9 +195,14 @@ def getOnePageReview(movieId, url):
         # print([movieId, user, score, reviewTime])
         onePageReviewList.append([movieId, user, score, reviewTime, review])
     print("This Page Have %d Review." % (length))
-    return (length < 10 ), onePageReviewList #评论数=0说明所有评论读取完毕
+    return length, onePageReviewList #评论数=0说明所有评论读取完毕
 
 def saveInfo(data):
+    """
+    存储评论数据
+    :param data: 数据对象
+    :return: None
+    """
     lock.acquire()
     with open(ReviewDataPath, 'a', encoding="utf-8", newline="") as f:  # 必须用'a'模式打开
         writer_review = csv.writer(f)  # 创建写对象
@@ -145,6 +211,11 @@ def saveInfo(data):
     lock.release()
 
 def getMovieId(fileName):
+    """
+    获取mivieId
+    :param fileName: 文件名
+    :return: movieId的List
+    """
     MovieIdList =[]
     with open(fileName, 'r', encoding="utf-8") as f:
         csv_reader = csv.reader(f)
@@ -153,24 +224,39 @@ def getMovieId(fileName):
     return MovieIdList
 
 def initlock(l):
+    """
+    进程池全局锁
+    :param l: 锁
+    :return: None
+    """
     global lock
     lock = l
 
 def main():
-    allMovieIdSet = set(getMovieId(MovieIdDataPath))
-    finishedMovieIdSet = set(getMovieId(FinishedMivieIdPath))
+    """
+    主函数
+    :return: None
+    """
+    allMovieIdSet = set(getMovieId(MovieIdDataPath)) # 所有的电影ID
+    finishedMovieIdSet = set(getMovieId(FinishedMivieIdPath)) #已完成的电影ID
     if len(finishedMovieIdSet) == 0:
+    # 已完成电影为0 就要在评论文件写入一行
         with open(ReviewDataPath, 'a', encoding="utf-8", newline="") as f:
             writer_review = csv.writer(f)  # 创建写对象
             writer_review.writerow(["movieId", "reviewerId", "score", "reviewTime", "review"])
-    unFinishedMovieIdList = list(allMovieIdSet - finishedMovieIdSet)
-    lock = Lock()
-    pool = Pool(16, initializer=initlock, initargs=(lock,))
-    pool.map(getAllPageReview, unFinishedMovieIdList)
+    unFinishedMovieIdList = list(allMovieIdSet - finishedMovieIdSet) # 求未完成电影的列表
+    lock = Lock() #进程池全局锁
+    pool = Pool(40, initializer=initlock, initargs=(lock,)) #创建进程池
+    pool.map(getAllPageReview, unFinishedMovieIdList) #把任务塞入进程池
     pool.close()  # 关闭进程池，不再接受新的进程
     pool.join()  # 主进程阻塞等待子进程的退出
 
 def test():
+    """
+    测试有多少未爬完
+    在跑爬虫时用不到
+    :return: None
+    """
     allMovieId = set(getMovieId(MovieIdDataPath))
     finishedMovieId = set(getMovieId(FinishedMivieIdPath))
     if len(finishedMovieId) == 0:
