@@ -1,2 +1,0 @@
-# ImdbSpider
-imdb spider
